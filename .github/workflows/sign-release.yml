@@ -726,6 +726,8 @@ jobs:
       - name: Verify and attest macOS signing state
         env:
           DRY_RUN: ${{ inputs.dry-run }}
+          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           expected=(
@@ -758,6 +760,24 @@ jobs:
 
           mkdir -p attest
           : > attest/macos.tsv
+          # Publisher attestation the manifest generator needs for the
+          # signingIdentity/signingTeamId fields on .pkg entries. Always
+          # created so the uploaded artifact has a constant shape; it stays
+          # empty on a dry run, where nothing was signed to attest to.
+          : > attest/macos-publishers.tsv
+          if [ "$DRY_RUN" != "true" ]; then
+            if ! printf '%s' "${APPLE_TEAM_ID:-}" | grep -Eq '^[A-Z0-9]{10}$'; then
+              echo "::error::invalid macOS package signing team ID (APPLE_TEAM_ID must be 10 chars of [A-Z0-9])"
+              exit 1
+            fi
+            case "${APPLE_INSTALLER_IDENTITY:-}" in
+              "Developer ID Installer: "*" ($APPLE_TEAM_ID)") ;;
+              *)
+                echo "::error::invalid macOS package signing identity (APPLE_INSTALLER_IDENTITY must look like 'Developer ID Installer: <name> ($APPLE_TEAM_ID)')"
+                exit 1
+                ;;
+            esac
+          fi
           for name in "${expected[@]}"; do
             path="out/$name"
             if [ ! -s "$path" ]; then
@@ -771,9 +791,20 @@ jobs:
             fi
             case "$name" in
               *.pkg)
-                pkgutil --check-signature "$path"
+                signature="$(pkgutil --check-signature "$path")"
+                printf '%s\n' "$signature"
                 xcrun stapler validate "$path"
                 spctl -a -vv -t install "$path"
+                # Attest the publisher from what actually signed the bytes, not
+                # from the secret alone: pkgutil's certificate chain must name
+                # the configured identity, or the manifest would swear to an
+                # identity that never touched this package.
+                if ! printf '%s\n' "$signature" | grep -qF "$APPLE_INSTALLER_IDENTITY"; then
+                  echo "::error::$name is not signed by APPLE_INSTALLER_IDENTITY — refusing to attest a publisher nobody verified"
+                  exit 1
+                fi
+                printf '%s\t%s\t%s\n' "$name" "$APPLE_INSTALLER_IDENTITY" "$APPLE_TEAM_ID" \
+                  >> attest/macos-publishers.tsv
                 ;;
               *.app.zip)
                 # Assess the bundle this zip was made from — Gatekeeper cannot
@@ -806,6 +837,7 @@ jobs:
             echo "Verified: $name"
           done
           cat attest/macos.tsv
+          cat attest/macos-publishers.tsv
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -821,7 +853,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attestation-macos
-          path: attest/macos.tsv
+          # Both files always exist (the publishers file is empty on a dry
+          # run), so `error` still catches a step that stopped producing them.
+          path: |
+            attest/macos.tsv
+            attest/macos-publishers.tsv
           if-no-files-found: error
           retention-days: 7
 
@@ -932,6 +968,7 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           from pathlib import Path
 
           release_dir = Path("release-assets")
@@ -979,6 +1016,35 @@ jobs:
                       raise SystemExit(f"malformed attestation line in {tsv}: {line!r}")
                   attested[name] = trust
 
+          # Publisher of each signed .pkg, as observed by `pkgutil
+          # --check-signature` on the macOS runner. The format is re-validated
+          # here rather than trusted: this file crossed a job boundary as an
+          # artifact, and the manifest fields it feeds are what edition-aware
+          # Breeze instances check the macOS installer against.
+          pkg_publishers = {}
+          publishers_tsv = attest_dir / "macos-publishers.tsv"
+          if macos_ran and publishers_tsv.is_file():
+              for line in publishers_tsv.read_text(encoding="utf8").splitlines():
+                  if not line.strip():
+                      continue
+                  # Split on tabs only — identities contain spaces and parens.
+                  fields = line.split("\t")
+                  if len(fields) != 3:
+                      raise SystemExit(f"malformed publisher line in {publishers_tsv}: {line!r}")
+                  name, signing_identity, signing_team_id = fields
+                  if not re.fullmatch(r"[A-Z0-9]{10}", signing_team_id):
+                      raise SystemExit(f"invalid macOS package signing team ID for {name}")
+                  if not signing_identity.startswith(
+                      "Developer ID Installer: "
+                  ) or not signing_identity.endswith(f" ({signing_team_id})"):
+                      raise SystemExit(f"invalid macOS package signing identity for {name}")
+                  pkg_publishers[name] = (signing_identity, signing_team_id)
+
+          if dry_run and pkg_publishers:
+              raise SystemExit(
+                  "dry run produced a macOS publisher attestation — refusing to publish"
+              )
+
           if dry_run and any(t != "unsigned-dry-run" for t in attested.values()):
               raise SystemExit(
                   "dry run produced a signed-artifact attestation — refusing to publish"
@@ -992,6 +1058,14 @@ jobs:
           official_trust = {
               a["name"]: a.get("platformTrust") for a in official.get("assets", [])
           }
+          official_edition = {
+              a["name"]: a.get("edition") for a in official.get("assets", [])
+          }
+          # Releases before the BYO-signing edition work carry no `edition` at
+          # all. Stamping one there would put a claim in the manifest the
+          # official pipeline never made, so follow whatever the verified
+          # official manifest for THIS release does.
+          official_edition_aware = any("edition" in a for a in official.get("assets", []))
           mirrored = [
               line
               for line in (attest_dir / "mirrored.txt").read_text(encoding="utf8").splitlines()
@@ -1038,12 +1112,49 @@ jobs:
                           f"mirrored asset {name} has no platformTrust in the verified "
                           "official manifest — refusing to invent one"
                       )
-              assets.append({
+              entry = {
                   "name": name,
                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                   "size": path.stat().st_size,
                   "platformTrust": trust,
-              })
+              }
+              if name in attested:
+                  # Everything this workflow signs is a self-host build; the
+                  # 0.113.0+ API refuses a macOS installer whose manifest entry
+                  # does not carry the edition it expects.
+                  if official_edition_aware:
+                      entry["edition"] = "self-host"
+                  if name.endswith(".pkg") and trust == "macos-developer-id-notarization-required":
+                      publisher = pkg_publishers.get(name)
+                      if publisher is None:
+                          raise SystemExit(f"macOS package {name} has no publisher attestation")
+                      entry["signingIdentity"], entry["signingTeamId"] = publisher
+              else:
+                  edition = official_edition.get(name)
+                  if edition is not None:
+                      entry["edition"] = edition
+              assets.append(entry)
+
+          # Non-regression guard, mirroring the official pipeline: a manifest
+          # that lost these fields still passes every check above but fails
+          # macOS download verification on edition-aware instances, which is
+          # only discovered by an end user. Block the release instead.
+          if official_edition_aware and not dry_run:
+              for entry in assets:
+                  if entry["name"] not in attested:
+                      continue
+                  if entry.get("edition") != "self-host":
+                      raise SystemExit(
+                          f"generated asset {entry['name']} is missing edition=self-host"
+                      )
+                  if (
+                      entry["name"].endswith(".pkg")
+                      and entry["platformTrust"] == "macos-developer-id-notarization-required"
+                      and not (entry.get("signingIdentity") and entry.get("signingTeamId"))
+                  ):
+                      raise SystemExit(
+                          f"macOS package {entry['name']} is missing publisher fields"
+                      )
 
           manifest = {
               "schemaVersion": 1,
