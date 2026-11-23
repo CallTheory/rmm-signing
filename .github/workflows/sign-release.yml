@@ -946,6 +946,23 @@ jobs:
             breeze-helper-macos.dmg
             breeze-helper-linux.AppImage
           )
+          # Mirrored only when the verified official manifest for THIS release
+          # lists them, so older releases that predate an asset still sign.
+          #   breeze-yara-builtin.json: the built-in YARA pack. With
+          #   BINARY_SOURCE=github the API loads it from the repointed
+          #   repository's release (apps/api/src/services/yaraBuiltinPack.ts);
+          #   if it is absent there the API logs "does not ship a built-in
+          #   pack" and the built-in rule set is silently never loaded.
+          OPTIONAL_MIRROR_ASSETS=(
+            breeze-yara-builtin.json
+          )
+          for asset in "${OPTIONAL_MIRROR_ASSETS[@]}"; do
+            if jq -e --arg n "$asset" 'any(.assets[]; .name == $n)' "$OFFICIAL_MANIFEST_PATH" >/dev/null; then
+              MIRROR_ASSETS+=("$asset")
+            else
+              echo "Official v$VERSION manifest does not list $asset; not mirroring it"
+            fi
+          done
           # Record what was mirrored so the manifest generator has a single
           # source of truth for the mirrored set rather than a second copy of
           # this list that can drift out of step with it.
@@ -1051,6 +1068,19 @@ jobs:
           official_trust = {
               a["name"]: a.get("platformTrust") for a in official.get("assets", [])
           }
+          # Minimum macOS per darwin asset (#12169). The official release stamps
+          # `minOs` from agent/platform-floors.json at the same sourceCommit our
+          # binaries and pkgs were built from (build-pkg.sh embeds the same
+          # floor), so the verified official value is the correct claim for our
+          # re-signed bytes too. The Breeze API refuses to register darwin
+          # assets without it from v0.131.0 on.
+          official_min_os = {}
+          for a in official.get("assets", []):
+              if "minOs" not in a:
+                  continue
+              if not isinstance(a["minOs"], str) or not re.fullmatch(r"\d{1,3}(\.\d{1,3}){0,2}", a["minOs"]):
+                  raise SystemExit(f"official manifest has a malformed minOs for {a.get('name')!r}")
+              official_min_os[a["name"]] = a["minOs"]
           mirrored = [
               line
               for line in (attest_dir / "mirrored.txt").read_text(encoding="utf8").splitlines()
@@ -1111,7 +1141,22 @@ jobs:
               publisher = attested.get(name, {}).get("publisher")
               if publisher is not None:
                   entry["signingIdentity"], entry["signingTeamId"] = publisher
+              if name in official_min_os:
+                  entry["minOs"] = official_min_os[name]
               assets.append(entry)
+
+          # Non-regression guard: once the official release stamps minOs, every
+          # darwin binary/pkg we publish must carry it, or edition-aware APIs
+          # (v0.131.0+) refuse to register it and Macs silently stop updating.
+          # Mirrors the API's DARWIN_MIN_OS_ASSET_RE.
+          darwin_min_os_re = re.compile(
+              r"breeze-(?:(?:agent|backup|watchdog|desktop-helper)-darwin-(?:amd64|arm64)"
+              r"|agent-darwin-(?:amd64|arm64)\.pkg)"
+          )
+          if official_min_os:
+              for entry in assets:
+                  if darwin_min_os_re.fullmatch(entry["name"]) and "minOs" not in entry:
+                      raise SystemExit(f"darwin asset {entry['name']} is missing minOs")
 
           manifest = {
               "schemaVersion": 1,
