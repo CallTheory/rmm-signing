@@ -34,7 +34,11 @@ Packages** in the Breeze docs (`/deploy/sign-your-own-packages/`).
    from the official manifest already verified in step 1. `publish` refuses
    to build a manifest covering an asset that neither accounts for, so a
    component that slips past a signing step fails the run instead of being
-   published as "signed".
+   published as "signed". macOS package attestations additionally record the
+   exact `Developer ID Installer` leaf identity and Apple Team ID after both
+   values are matched against your configured signing secrets. Every manifest
+   entry is also bound to `edition: "self-host"`; this template never produces
+   hosted-edition agent artifacts.
 
 Your agents never trust this repo's key directly — your Breeze API re-signs
 update manifests with its per-deployment key (standard since the BYO-signing
@@ -162,3 +166,20 @@ manifest key), `checksums.txt`.
 - **Key rotation**: when LanternOps rotates the official manifest key,
   `official-release-key.pub` changes here — pull template updates before
   signing a release made with the new key.
+
+## Local changes vs upstream
+
+Synced from `selfhost-signing-template/` in
+[lanternops/breeze](https://github.com/lanternops/breeze) at **v0.130.0**
+(`e8ba47e`) — that directory is the source of truth; the public
+`LanternOps/breeze-selfhost-signing` repo lags behind it. On top of it:
+
+- **Mirror `breeze-yara-builtin.json`** (when the official manifest lists it).
+  With `BINARY_SOURCE=github` the API loads the built-in YARA pack from *this*
+  repo's release; without it the built-in rules are silently never loaded.
+- **Carry `minOs` onto darwin binaries/pkgs** from the verified official
+  manifest (same source commit, same `agent/platform-floors.json`). The API
+  refuses to register darwin assets without it from v0.131.0.
+
+When re-syncing, diff against the new tag's `selfhost-signing-template/` and
+drop either item once upstream covers it.
